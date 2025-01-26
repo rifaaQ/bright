@@ -2,23 +2,35 @@ import os.path
 import time
 import torch
 import json
-import cohere
+# import cohere
 import numpy as np
-import vertexai
+# import vertexai
 import pytrec_eval
-import tiktoken
-import voyageai
+# import tiktoken
+# import voyageai
 from tqdm import tqdm,trange
 import torch.nn.functional as F
 from gritlm import GritLM
-from openai import OpenAI
+# from openai import OpenAI
 from transformers import AutoTokenizer, AutoModel
-from InstructorEmbedding import INSTRUCTOR
+# from InstructorEmbedding import INSTRUCTOR
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 # from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 from torchmetrics.functional.pairwise import pairwise_cosine_similarity
+
+
+import lightning as L
+
+# from litgpt import Tokenizer
+# from litgpt.config import Config
+# from litgpt.retrieval_model import PrefixSuffixNet
+# from litgpt.multiple_negative_ranking_loss import cos_sim
+
+import sys
+import os
+
 
 def cut_text(text,tokenizer,threshold):
     text_ids = tokenizer(text)['input_ids']
@@ -524,6 +536,132 @@ def retrieval_google(queries,query_ids,documents,doc_ids,task,model_id,cache_dir
     return get_scores(query_ids=query_ids,doc_ids=doc_ids,scores=scores,excluded_ids=excluded_ids)
 
 
+def load_prefix_suffix():
+   from functools import partial
+   import json
+   import sys
+   import time
+   from pathlib import Path
+   from typing import Any, Dict, List
+   import torch
+   import lightning as L
+   # support running without installing as a package
+   # wd = "./lit-gpt-dev"
+   wd = Path(__file__).parent.parent.resolve()
+   sys.path.append(str(wd))
+   print("HELLO")
+   print(sys.path)
+   from litgpt import Tokenizer
+   from litgpt.config import Config
+   from litgpt.retrieval_model import PrefixSuffixNet
+   from litgpt.multiple_negative_ranking_loss import cos_sim
+   # BEGIN HECK
+   # as a hack we need to be able to get utils from the main training script
+   # so we add the repo root to the python path
+   import sys
+   import os
+   repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+#    print(repo_root)
+   sys.path.append(repo_root)
+   #repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+   # sys.path.append(repo_root)
+   # this captures things like the scale_lr function and stuff
+   # from train_retrieval_w_anticausal import *
+   #/home/mqadri/rq/lit-gpt-dev/
+#    print(sys.path)
+   print(os.getcwd())
+   model_path = "/home/mqadri/rq/lit-gpt-dev/pythia-160m-fineweb-retrieval-pretrained-01"
+   run_config_path = model_path + "/run_config.json"
+   model_config_path = model_path + "/model_config.json"
+   checkpoint_dir = model_path + "/lit_ckpts/step-00072000_ckpt.pth" # step-00120000_ckpt.pth" #step-00072000_ckpt.pth"
+   tokenizer_path = model_path + "/ret_meta_tokens"
+   run_config = json.load(open(run_config_path, "r"))
+   
+#    run_config_path = "../pythia-1.4b-retr-32k_w_meta-phase1" + "/run_config.json"
+#    model_config_path = "../pythia-1.4b-retr-32k_w_meta-phase1" + "/model_config.json"
+#    checkpoint_dir = "../pythia-1.4b-retr-32k_w_meta-phase1" + "/lit_ckpts/step-00120000_ckpt.pth" #step-00072000_ckpt.pth"
+#    tokenizer_path = "../pythia-1.4b-retr-32k_w_meta-phase1" + "/ret_meta_tokens"
+#    run_config = json.load(open(run_config_path, "r"))
+
+   model_config = Config.from_file(Path(model_config_path))
+   model_config.structured_init = False
+   model_config.structured_init_for_wte = False
+   model_config.structured_init_olmo_variant = False
+   model_config.strategy = "ddp"  # TODO: It's a placeholder to avoid error, need to be fixed
+   model_config.attn_impl = "sdpa"
+
+   max_seq_length = run_config["block_size"]
+
+   tokenizer = Tokenizer(tokenizer_path)
+   print("====== Model args: ======")
+   print("Tokenizer path:", tokenizer_path)
+   print("suffix_is_prefix:", run_config["suffix_is_prefix"])
+   print("flip_rope_embedding_suffix:", run_config["flip_rope_embedding_suffix"])
+   print("add_suf_pre_tokens:", run_config["add_suf_pre_tokens"])
+   print("nope_pos_embeddings:", run_config["nope_pos_embedding"])
+   model = PrefixSuffixNet(
+   model_config,
+   objective=None,
+   tokenizer=tokenizer,
+   suffix_is_prefix=run_config["suffix_is_prefix"],
+   flip_rope_embedding_suffix=run_config["flip_rope_embedding_suffix"],
+   add_suf_pre_tokens=run_config["add_suf_pre_tokens"],
+   nope_pos_embeddings=run_config["nope_pos_embedding"],
+   )
+
+   checkpoint = torch.load(checkpoint_dir, map_location=torch.device("cpu"))
+   model.load_state_dict(checkpoint["model"])
+
+   if run_config["suffix_is_prefix"]:
+      assert model.prefix_model == model.suffix_model
+
+   for name, param in model.named_parameters():
+      print(name, param.size(), param.dtype, param.device)
+      print(param)
+      break
+   model = model.to(torch.bfloat16).to("cuda:0")
+   return model
+
+def retrieval_prefix_suffix(queries,query_ids,documents,doc_ids,task,model_id,cache_dir,excluded_ids,long_context,**kwargs):
+    model = load_prefix_suffix()
+    print(model)
+    from litgpt.multiple_negative_ranking_loss import cos_sim
+    from functools import partial
+
+    query_emb = []
+    doc_emb = []
+    batch_size = kwargs.get('batch_size',8)
+    doc_emb = None
+    cache_path = os.path.join(cache_dir, 'doc_emb', model_id, task, f"long_{long_context}_{batch_size}.npy")
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    if os.path.isfile(cache_path):
+        # already exists so we can just load it
+        doc_emb = np.load(cache_path, allow_pickle=True)
+    
+    # model.encode_queries = partial(model.encode_queries, instruction="<s><QUERY> {text} <QUERY>")
+    # model.encode_corpus = partial(model.encode_corpus, instruction="<DOC> {text} <DOC>")
+        
+    #FINEWEB: 
+    model.encode_queries = partial(model.encode_queries, instruction="<s>{text}")
+    model.encode_corpus = partial(model.encode_corpus, instruction="{text}")
+
+
+
+    emb = model.encode_corpus(corpus=documents, batch_size=1)
+    doc_emb = emb
+    
+    np.save(cache_path, emb)
+    # queries = add_instruct_concatenate(texts=queries,task=task,instruction="Retrieve documents for {task}: ")
+    query_embs = model.encode_queries(queries=queries, batch_size = 1) #, model=model, task=task)
+
+    # query_emb = F.normalize(query_emb, p=2, dim=1)
+    # for start_idx in trange(0, len(queries), batch_size):
+        # query_emb += model.encode_queries(queries=queries[start_idx:start_idx + batch_size], model=model, task=task)
+    scores = cos_sim(query_embs, doc_emb) #torch.tensor(query_emb), torch.tensor(doc_emb))
+    scores = scores.tolist()
+    return get_scores(query_ids=query_ids,doc_ids=doc_ids,scores=scores,excluded_ids=excluded_ids)
+
+
 RETRIEVAL_FUNCS = {
     'sf': retrieval_sf_qwen_e5,
     'qwen': retrieval_sf_qwen_e5,
@@ -538,7 +676,8 @@ RETRIEVAL_FUNCS = {
     'cohere': retrieval_cohere,
     'voyage': retrieval_voyage,
     'openai': retrieval_openai,
-    'google': retrieval_google
+    'google': retrieval_google,
+    'our_model': retrieval_prefix_suffix,
 }
 
 def calculate_retrieval_metrics(results, qrels, k_values=[1, 5, 10, 25, 50, 100]):
